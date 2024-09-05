@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -12,16 +13,75 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 
-	"github.com/mxschmitt/playwright-go"
+	"github.com/playwright-community/playwright-go"
 	"github.com/rustycl0ck/go-openconnect-sso/config"
 	"gopkg.in/alecthomas/kingpin.v2"
 )
+
+const (
+	cookiesFileName = "cookies.json"
+	cacheFolderTpl  = "%s/.cache/go-openconnect-sso/"
+)
+
+func getCookiesFilePath() string {
+	cacheFolder := fmt.Sprintf(cacheFolderTpl, os.Getenv("HOME"))
+	if _, err := os.Stat(cacheFolder); err != nil {
+		os.MkdirAll(cacheFolder, os.ModePerm)
+	}
+	return cacheFolder + cookiesFileName
+}
+
+func loadCookies(logger log.Logger, context playwright.BrowserContext) {
+	filePath := getCookiesFilePath()
+
+	optionalCookies := []playwright.OptionalCookie{}
+
+	if _, err := os.Stat(filePath); err == nil {
+		file, err := os.ReadFile(filePath)
+		if err != nil {
+			level.Error(logger).Log("msg", "could not create file", "err", err)
+		}
+
+		err = json.Unmarshal(file, &optionalCookies)
+		if err != nil {
+			level.Error(logger).Log("msg", "error parsing json", "err", err)
+		}
+	}
+	context.AddCookies(optionalCookies)
+}
+
+func saveCookies(logger log.Logger, context playwright.BrowserContext) {
+	filePath := getCookiesFilePath()
+
+	cookies, err := context.Cookies()
+	if err != nil {
+		level.Error(logger).Log("msg", "could not get cookies from browser context", "err", err)
+	}
+
+	cookiesJSON, err := json.Marshal(cookies)
+	if err != nil {
+		if err != nil {
+			level.Error(logger).Log("msg", "could not marshal cookies", "err", err)
+		}
+	}
+
+	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		level.Error(logger).Log("msg", "could not create file", "err", err)
+	}
+	defer file.Close()
+
+	_, err = file.Write(cookiesJSON)
+	if err != nil {
+		level.Error(logger).Log("msg", "could not write to file", "err", err)
+	}
+}
 
 func main() {
 	var logger log.Logger
 
 	var server = kingpin.Flag("server", "the OpenConnect VPN server address").Short('s').Required().String()
-	var ocFile = kingpin.Flag("config", "the where OpenCOnnect config file will be saved").Short('c').Required().String()
+	var ocFile = kingpin.Flag("config", "the where OpenConnect config file will be saved").Short('c').Required().String()
 	var logFormat = kingpin.Flag("log-format", "log format").Default("logfmt").Enum("json", "logfmt")
 	var logLevel = kingpin.Flag("log-level", "log level [WARNING: 'debug' level will print openconnect login cookie to the console]").Default("info").Enum("info", "warn", "error", "debug", "none")
 	kingpin.Parse()
@@ -58,6 +118,8 @@ func main() {
 		level.Error(logger).Log("msg", "could not launch Firefox", "err", err)
 	}
 	context, err := browser.NewContext()
+	loadCookies(logger, context)
+
 	if err != nil {
 		level.Error(logger).Log("msg", "could not create context", "err", err)
 	}
@@ -71,7 +133,7 @@ func main() {
 	level.Info(logger).Log("msg", "waiting to detect successful authentication token cookie on the browser")
 	page.Goto(initResp.LoginURL)
 
-	var tokenCookie playwright.NetworkCookie
+	var tokenCookie playwright.Cookie
 
 	for {
 		foundCookie := false
@@ -82,14 +144,13 @@ func main() {
 
 		for _, cookie := range cookies {
 			if cookie.Name == initResp.TokenCookieName {
-				tokenCookie = *cookie
+				tokenCookie = cookie
 				level.Info(logger).Log("msg", "received successful authentication token cookie from browser")
 				foundCookie = true
 				break
 			}
 		}
 		if foundCookie {
-			browser.Close()
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -97,6 +158,10 @@ func main() {
 
 	finalResp := finalizationStage(logger, targetVPNServer, tokenCookie.Value, initResp.Opaque.Value)
 	level.Info(logger).Log("msg", "received openconnect server fingerprint and connection cookie successfully")
+
+	saveCookies(logger, context)
+
+	browser.Close()
 
 	writeOCConfig(logger, finalResp.Cookie, finalResp.Fingerprint, targetVPNServer, *ocFile)
 }
